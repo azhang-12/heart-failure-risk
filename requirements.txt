@@ -4,3 +4,5 @@ matplotlib
 scikit-learn
 lifelines
 streamlit
+shap
+scipy
