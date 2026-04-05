@@ -1,0 +1,206 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from sklearn.model_selection import train_test_split
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.calibration import CalibratedClassifierCV
+from sklearn.metrics import roc_auc_score
+from lifelines import KaplanMeierFitter, CoxPHFitter
+from lifelines.statistics import logrank_test
+from scipy import stats
+
+# ============================================================
+# LOAD DATA & USE ONLY SIGNIFICANT FEATURES
+# ============================================================
+
+df = pd.read_csv('heart_failure_clinical_records_dataset.csv')
+
+# Only statistically significant features from Step 2
+features = ['age', 'ejection_fraction', 'serum_creatinine', 'serum_sodium', 'time']
+X = df[features]
+y = df['DEATH_EVENT']
+
+print("=" * 60)
+print("USING FEATURES:", features)
+print("=" * 60)
+
+# ============================================================
+# STEP 3 — RANDOM FOREST + PLATT SCALING
+# ============================================================
+
+print("\nSTEP 3 — RANDOM FOREST + PLATT SCALING")
+print("-" * 60)
+
+# 80/20 split
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=0.2, random_state=42, stratify=y
+)
+
+print(f"Training patients: {len(X_train)}")
+print(f"Testing patients:  {len(X_test)}")
+print(f"Deaths in train:   {y_train.sum()} ({y_train.mean()*100:.1f}%)")
+print(f"Deaths in test:    {y_test.sum()} ({y_test.mean()*100:.1f}%)")
+
+# Random Forest base model
+rf = RandomForestClassifier(
+    n_estimators=500,
+    max_depth=6,
+    min_samples_leaf=10,
+    random_state=42
+)
+
+# Platt Scaling wraps around Random Forest
+# sigmoid method = Platt Scaling
+model = CalibratedClassifierCV(rf, method='sigmoid', cv=5)
+model.fit(X_train, y_train)
+
+# Get calibrated probabilities
+prob_test = model.predict_proba(X_test)[:, 1]
+prob_all  = model.predict_proba(X)[:, 1]
+
+# AUC Score
+auc = roc_auc_score(y_test, prob_test)
+print(f"\nCalibrated Model AUC: {auc:.3f}")
+
+# Add probabilities back to full dataframe
+df['risk_score'] = prob_all * 100  # 0-100%
+
+print("\nSample Patient Risk Scores:")
+print(f"{'Patient':<10} {'Age':>5} {'EF%':>6} {'Creat':>7} {'Sodium':>7} {'Time':>6} {'Risk%':>8} {'Actual':>8}")
+print("-" * 60)
+for i in range(10):
+    row = df.iloc[i]
+    risk_label = "HIGH" if row['risk_score'] >= 60 else "MEDIUM" if row['risk_score'] >= 30 else "LOW"
+    print(f"{i+1:<10} {row['age']:>5.0f} {row['ejection_fraction']:>6.0f} "
+          f"{row['serum_creatinine']:>7.2f} {row['serum_sodium']:>7.0f} "
+          f"{row['time']:>6.0f} {row['risk_score']:>7.1f}% "
+          f"{'DIED' if row['DEATH_EVENT']==1 else 'SURV':>8}")
+
+# ============================================================
+# STEP 4 — KAPLAN-MEIER SURVIVAL CURVE
+# ============================================================
+
+print("\n" + "=" * 60)
+print("STEP 4 — KAPLAN-MEIER SURVIVAL CURVE")
+print("=" * 60)
+
+kmf = KaplanMeierFitter()
+
+fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+
+# Overall survival curve
+kmf.fit(df['time'], event_observed=df['DEATH_EVENT'], label='All Patients')
+kmf.plot_survival_function(ax=axes[0], ci_show=True, color='steelblue')
+axes[0].set_title('Kaplan-Meier Overall Survival Curve', fontsize=13)
+axes[0].set_xlabel('Follow-up Days')
+axes[0].set_ylabel('Survival Probability')
+axes[0].axhline(y=0.5, color='red', linestyle='--', alpha=0.5, label='50% survival')
+axes[0].legend()
+
+# Median survival time
+median_survival = kmf.median_survival_time_
+print(f"Median survival time: {median_survival} days")
+print("(50% of patients survived past this point)")
+
+# Survival at specific timepoints
+for t in [30, 60, 90, 180, 250]:
+    prob = kmf.survival_function_at_times(t).values[0]
+    print(f"Survival at day {t:>3}: {prob*100:.1f}%")
+
+# ============================================================
+# STEP 5 — COX PROPORTIONAL HAZARDS
+# ============================================================
+
+print("\n" + "=" * 60)
+print("STEP 5 — COX PROPORTIONAL HAZARDS MODEL")
+print("=" * 60)
+
+# Cox needs time + event + features in one dataframe
+cox_df = df[features + ['DEATH_EVENT']].copy()
+
+cph = CoxPHFitter()
+cph.fit(cox_df, duration_col='time', event_col='DEATH_EVENT')
+
+print("\nCox Model Summary:")
+cph.print_summary()
+
+# Hazard ratios
+print("\nHazard Ratios (how much each feature multiplies your risk):")
+hr = np.exp(cph.params_)
+for feature, ratio in hr.items():
+    direction = "↑ increases risk" if ratio > 1 else "↓ decreases risk"
+    print(f"  {feature:<25} HR={ratio:.3f}  {direction}")
+
+# Add Cox risk score to dataframe
+df['cox_risk'] = cph.predict_partial_hazard(cox_df)
+
+# ============================================================
+# STEP 6 — VALIDATE: HIGH/LOW RISK VS BINARY OUTCOME
+# ============================================================
+
+print("\n" + "=" * 60)
+print("STEP 6 — VALIDATION: HIGH VS LOW RISK GROUPS")
+print("=" * 60)
+
+# Split at median cox risk score
+median_cox = df['cox_risk'].median()
+df['risk_group'] = df['cox_risk'].apply(
+    lambda x: 'High Risk' if x >= median_cox else 'Low Risk'
+)
+
+high_risk = df[df['risk_group'] == 'High Risk']
+low_risk  = df[df['risk_group'] == 'Low Risk']
+
+# Death rates in each group
+print(f"\nHigh Risk group — Deaths: {high_risk['DEATH_EVENT'].sum()}/{len(high_risk)} "
+      f"({high_risk['DEATH_EVENT'].mean()*100:.1f}%)")
+print(f"Low Risk group  — Deaths: {low_risk['DEATH_EVENT'].sum()}/{len(low_risk)} "
+      f"({low_risk['DEATH_EVENT'].mean()*100:.1f}%)")
+
+# Log-rank test
+results = logrank_test(
+    high_risk['time'], low_risk['time'],
+    event_observed_A=high_risk['DEATH_EVENT'],
+    event_observed_B=low_risk['DEATH_EVENT']
+)
+print(f"\nLog-rank test p-value: {results.p_value:.6f}")
+if results.p_value < 0.05:
+    print("✓ SIGNIFICANT — High/Low risk groups have statistically different survival!")
+else:
+    print("✗ NOT significant — groups not well separated")
+
+# Plot two KM curves — High vs Low Risk
+kmf_high = KaplanMeierFitter()
+kmf_low  = KaplanMeierFitter()
+
+kmf_high.fit(high_risk['time'], event_observed=high_risk['DEATH_EVENT'], label='High Risk')
+kmf_low.fit(low_risk['time'],  event_observed=low_risk['DEATH_EVENT'],  label='Low Risk')
+
+kmf_high.plot_survival_function(ax=axes[1], ci_show=True, color='salmon')
+kmf_low.plot_survival_function(ax=axes[1],  ci_show=True, color='steelblue')
+axes[1].set_title('Survival: High Risk vs Low Risk Groups', fontsize=13)
+axes[1].set_xlabel('Follow-up Days')
+axes[1].set_ylabel('Survival Probability')
+axes[1].legend()
+
+plt.tight_layout()
+plt.savefig('step4_6_survival_curves.png')
+plt.show()
+
+# Confusion style check
+print("\nRisk Group vs Actual Outcome:")
+print(pd.crosstab(df['risk_group'], df['DEATH_EVENT'],
+      rownames=['Risk Group'],
+      colnames=['Actual Death (0=No, 1=Yes)']))
+
+# Final summary
+print("\n" + "=" * 60)
+print("FINAL PATIENT RISK SUMMARY")
+print("=" * 60)
+print(f"{'Patient':<10} {'Risk Score':>12} {'Risk Group':>12} {'Actual':>10}")
+print("-" * 50)
+for i in range(20):
+    row = df.iloc[i]
+    print(f"{i+1:<10} {row['risk_score']:>11.1f}% "
+          f"{'High Risk' if row['risk_group']=='High Risk' else 'Low Risk':>12} "
+          f"{'DIED' if row['DEATH_EVENT']==1 else 'SURVIVED':>10}")
