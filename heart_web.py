@@ -26,7 +26,9 @@ st.set_page_config(
 @st.cache_resource
 def train_model():
     df = pd.read_csv('heart_failure_clinical_records_dataset.csv')
-    features = ['age', 'ejection_fraction', 'serum_creatinine', 'serum_sodium', 'time']
+
+    # 4 clinically valid features only (time removed — data leakage)
+    features = ['age', 'ejection_fraction', 'serum_creatinine', 'serum_sodium']
     X = df[features]
     y = df['DEATH_EVENT']
 
@@ -44,7 +46,9 @@ def train_model():
     prob_all = model.predict_proba(X)[:, 1] * 100
     df['rf_score'] = prob_all
 
-    cox_df = df[features + ['DEATH_EVENT']].copy()
+    # Cox uses time + DEATH_EVENT for survival curve only
+    # but only 4 features as predictors
+    cox_df = df[features + ['time', 'DEATH_EVENT']].copy()
     cph = CoxPHFitter()
     cph.fit(cox_df, duration_col='time', event_col='DEATH_EVENT')
 
@@ -71,11 +75,10 @@ st.title("🫀 Heart Failure Risk Assessment Tool")
 st.markdown("### Predicting mortality risk using clinical biomarkers")
 st.markdown("""
 This tool uses a **unified risk model** combining:
-- 🌳 Random Forest + Platt Scaling (AUC: 0.905)
+- 🌳 Random Forest + Platt Scaling
 - 📈 Cox Proportional Hazards survival analysis
-- **Unified AUC: 0.942**
 
-Based on 299 heart failure patients. Only statistically significant features are used.
+Based on 299 heart failure patients. Only statistically validated features are used.
 """)
 
 st.divider()
@@ -86,14 +89,12 @@ st.divider()
 
 with st.sidebar:
     st.header("📊 Model Statistics")
-    st.metric("Random Forest AUC", "0.905")
-    st.metric("Unified Score AUC", "0.942")
-    st.metric("Cox Concordance", "0.719")
-    st.metric("Log-rank p-value", "< 0.000001")
+    st.metric("Random Forest AUC", f"{auc:.3f}")
     st.metric("Training Patients", "299")
+    st.metric("Log-rank p-value", "< 0.000001")
 
     st.divider()
-    st.header("📋 Hazard Ratios")
+    st.header("📋 Hazard Ratios (Cox)")
     st.markdown("""
     | Feature | HR | Effect |
     |---|---|---|
@@ -104,6 +105,14 @@ with st.sidebar:
     """)
 
     st.divider()
+    st.header("⚠️ Methodology Note")
+    st.caption("""
+    Follow-up time was excluded as a predictor 
+    to prevent data leakage. It is used only 
+    for survival curve estimation via 
+    Kaplan-Meier, not for risk scoring.
+    """)
+    st.divider()
     st.caption("Built with Python, scikit-learn, lifelines & Streamlit")
 
 # ============================================================
@@ -112,20 +121,17 @@ with st.sidebar:
 
 st.header("👤 Patient Clinical Values")
 st.markdown("Adjust the sliders to match the patient's measurements:")
-st.info("ℹ️ Follow-up days is fixed at 30 days — representing a new patient at early assessment. This variable is used in model training but is not a prospective clinical input.")
 
 col1, col2 = st.columns(2)
 
 with col1:
     age = st.slider("Age", min_value=40, max_value=95, value=60, step=1)
     ejection_fraction = st.slider("Ejection Fraction (%)", min_value=10, max_value=80, value=38, step=1)
-    serum_creatinine = st.slider("Serum Creatinine", min_value=0.5, max_value=10.0, value=1.1, step=0.1)
 
 with col2:
+    serum_creatinine = st.slider("Serum Creatinine", min_value=0.5, max_value=10.0, value=1.1, step=0.1)
     serum_sodium = st.slider("Serum Sodium", min_value=110, max_value=150, value=137, step=1)
 
-# Time fixed at 30 days (new patient — follow-up not yet known)
-time = 30
 # ============================================================
 # CALCULATE RISK
 # ============================================================
@@ -133,19 +139,24 @@ time = 30
 if st.button("🔍 Calculate Risk", type="primary", use_container_width=True):
 
     patient = pd.DataFrame([[age, ejection_fraction, serum_creatinine,
-                              serum_sodium, time]], columns=features)
+                              serum_sodium]], columns=features)
 
+    # Random Forest probability
     rf_prob = model.predict_proba(patient)[0][1] * 100
 
+    # Cox score — features only, no time
     cox_input = patient.copy()
+    cox_input['time'] = 1
     cox_input['DEATH_EVENT'] = 0
     cox_raw = cph.predict_partial_hazard(cox_input).values[0]
     cox_norm = ((cox_raw - cox_min) / (cox_max - cox_min)) * 100
     cox_norm = np.clip(cox_norm, 0, 100)
 
+    # Unified score
     unified = (rf_prob * 0.6) + (cox_norm * 0.4)
     percentile = percentileofscore(df['unified_score'], unified)
 
+    # Risk category based on percentile
     if percentile >= 75:
         category = "HIGH RISK"
         color = "🔴"
@@ -162,7 +173,6 @@ if st.button("🔍 Calculate Risk", type="primary", use_container_width=True):
     st.divider()
     st.header("📋 Risk Assessment Results")
 
-    # Risk score display
     col1, col2, col3 = st.columns(3)
     with col1:
         st.metric("Random Forest Score", f"{rf_prob:.1f}%")
@@ -171,7 +181,6 @@ if st.button("🔍 Calculate Risk", type="primary", use_container_width=True):
     with col3:
         st.metric("Unified Risk Score", f"{unified:.1f}%")
 
-    # Risk category
     st.markdown(f"""
     <div style='background-color:{bg}; padding:20px; border-radius:10px; text-align:center'>
         <h2 style='color:white; margin:0'>{color} {category}</h2>
@@ -203,21 +212,28 @@ if st.button("🔍 Calculate Risk", type="primary", use_container_width=True):
         drivers.append(f"Age ({age}) — elevated baseline risk")
     if serum_sodium < 135:
         drivers.append(f"Low serum sodium ({serum_sodium}) — indicates severe heart failure")
-   
+
     if drivers:
         for d in drivers:
             st.warning(d)
     else:
-        st.success("No major individual risk drivers flagged")
+        st.success("✅ No major individual risk drivers flagged")
 
     # Survival curve
     st.divider()
-    st.subheader("📈 Survival Curve")
+    st.subheader("📈 Population Survival Curve (Kaplan-Meier)")
     fig, ax = plt.subplots(figsize=(10, 4))
-    kmf.plot_survival_function(ax=ax, ci_show=True, color='steelblue', label='Population')
-    ax.axvline(x=time, color='red', linestyle='--', alpha=0.7, label=f'Patient follow-up ({time} days)')
+    kmf.plot_survival_function(ax=ax, ci_show=True, color='steelblue',
+                               label='Population survival')
     ax.set_xlabel('Follow-up Days')
     ax.set_ylabel('Survival Probability')
     ax.set_title('Kaplan-Meier Survival Curve')
     ax.legend()
     st.pyplot(fig)
+
+    st.divider()
+    st.caption("""
+    ⚠️ This tool is for research purposes only and should not replace 
+    clinical judgment. Risk scores are based on a dataset of 299 patients 
+    and may not generalize to all populations.
+    """)
